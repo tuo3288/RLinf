@@ -20,13 +20,15 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from rlinf.data.embodied_io_struct import (
-    ChunkStepResult,
-    EmbodiedRolloutResult,
+from rlinf.data.schema.embodied_trajectory import TrajectoryAccumulator
+from rlinf.data.schema.embodied_types import (
+    TrajectoryStep,
 )
-from rlinf.data.replay_buffer import TrajectoryReplayBuffer
-from rlinf.envs.realworld.realworld_env import RealWorldEnv
+from rlinf.data.storage.replay import TrajectoryReplayBuffer
+from rlinf.envs.real import RealWorldEnv
+from rlinf.envs.real.wrappers.episode.session import KeyboardAbort
 from rlinf.scheduler import Cluster, ComponentPlacement, Worker
+from rlinf.utils.logging import get_logger
 
 
 class DataCollector(Worker):
@@ -92,7 +94,7 @@ class DataCollector(Worker):
         self._target_step_period = 1.0 / float(fps) if fps else None
 
     def _process_obs(self, obs):
-        """Reshape env obs into the dict EmbodiedRolloutResult expects."""
+        """Reshape env observations for the internal trajectory accumulator."""
         if not self.cfg.runner.record_task_description:
             obs.pop("task_descriptions", None)
 
@@ -100,14 +102,58 @@ class DataCollector(Worker):
         for key, val in obs.items():
             if isinstance(val, np.ndarray):
                 val = torch.from_numpy(val)
-            val = val.cpu()
+            if isinstance(val, torch.Tensor):
+                val = val.cpu()
+            elif key == "task_descriptions":
+                val = list(val)
+            else:
+                raise TypeError(
+                    f"Unsupported observation field {key!r}: {type(val).__name__}"
+                )
             if key == "images":
                 ret_obs["main_images"] = val.clone()
             else:
-                ret_obs[key] = val.clone()
+                ret_obs[key] = val.clone() if isinstance(val, torch.Tensor) else val
         return ret_obs
 
+    @staticmethod
+    def _drop_task_descriptions(obs: dict) -> dict:
+        """Remove task metadata before stacking trajectory observations."""
+        return {key: value for key, value in obs.items() if key != "task_descriptions"}
+
     def run(self):
+        """Collect episodes and leave hardware safe after every exit path."""
+        failed = False
+        try:
+            return self._collect()
+        except KeyboardAbort:
+            self.log_info("Operator requested collection shutdown.")
+            try:
+                self.env.get_wrapper_attr("park")()
+            except BaseException:  # noqa: BLE001 - preserve controlled shutdown
+                get_logger().exception(
+                    "Failed to park real-world hardware after operator shutdown"
+                )
+            return None
+        except BaseException:  # noqa: BLE001 - hardware cleanup includes interrupts
+            failed = True
+            try:
+                self.env.get_wrapper_attr("park")()
+            except BaseException:  # noqa: BLE001 - preserve the collection failure
+                get_logger().exception("Failed to park real-world hardware after error")
+            raise
+        finally:
+            try:
+                self.env.close()
+            except BaseException:  # noqa: BLE001 - preserve the collection failure
+                if not failed:
+                    raise
+                get_logger().exception(
+                    "Failed to close real-world hardware after error"
+                )
+
+    def _collect(self) -> None:
+        """Run the collection loop while :meth:`run` owns hardware cleanup."""
         obs, _ = self.env.reset()
         # Seed from preexisting episodes so resume bar + stop target line up.
         success_cnt = self._preexisting_success
@@ -121,7 +167,7 @@ class DataCollector(Worker):
             desc="Collecting Data Episodes:",
         )
 
-        current_rollout = EmbodiedRolloutResult(
+        current_rollout = TrajectoryAccumulator(
             max_episode_length=self.cfg.env.eval.max_episode_steps,
         )
 
@@ -152,25 +198,24 @@ class DataCollector(Worker):
             action_tensor = torch.as_tensor(action, dtype=torch.float32)
             reward_tensor = reward.float().unsqueeze(1)
 
-            step_result = ChunkStepResult(
+            step_result = TrajectoryStep(
                 actions=action_tensor,
                 rewards=reward_tensor,
                 dones=done_tensor,
                 terminations=terminated_tensor,
                 truncations=truncated_tensor,
                 forward_inputs={"action": action_tensor},
+                curr_obs=self._drop_task_descriptions(current_obs_processed),
+                next_obs=self._drop_task_descriptions(next_obs_processed),
             )
 
             # Rebuild rollout on rec-start or abort; ``restart`` kept for older wrappers.
             if kb_event in ("start", "restart", "abort"):
-                current_rollout = EmbodiedRolloutResult(
+                current_rollout = TrajectoryAccumulator(
                     max_episode_length=self.cfg.env.eval.max_episode_steps,
                 )
             if kb_phase in (None, "rec"):
-                current_rollout.append_step_result(step_result)
-                current_rollout.append_transitions(
-                    curr_obs=current_obs_processed, next_obs=next_obs_processed
-                )
+                current_rollout.append(step_result)
 
             obs = next_obs
             current_obs_processed = next_obs_processed
@@ -224,7 +269,7 @@ class DataCollector(Worker):
                     reset_options = {"skip_wait_for_start": True}
                 obs, _ = self.env.reset(options=reset_options)
                 current_obs_processed = self._process_obs(obs)
-                current_rollout = EmbodiedRolloutResult(
+                current_rollout = TrajectoryAccumulator(
                     max_episode_length=self.cfg.env.eval.max_episode_steps,
                 )
 
@@ -239,7 +284,6 @@ class DataCollector(Worker):
         self.log_info(
             f"Finished. Demos saved in: {os.path.join(self.cfg.runner.logger.log_path, 'demos')}"
         )
-        self.env.close()
 
 
 @hydra.main(

@@ -12,20 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .channel import Channel, ChannelWorker, WeightedItem
+from .channel import (
+    Channel,
+    ChannelContext,
+    ChannelWorker,
+    Collector,
+    Dispatcher,
+    WeightedItem,
+    register_collector,
+    register_dispatcher,
+)
 from .cluster import Cluster, ClusterConfig
 from .collective import CollectiveGroupOptions
 from .hardware import (
     AcceleratorType,
     AcceleratorUtil,
-    DOSW1HWInfo,
-    DualFrankaHWInfo,
-    FrankaHWInfo,
-    GimArmHWInfo,
     HardwareInfo,
-    Turtle2HWInfo,
 )
-from .manager import WorkerInfo
+from .manager import Tracer, WorkerInfo
 from .placement import (
     ComponentPlacement,
     FlexiblePlacementStrategy,
@@ -53,11 +57,6 @@ __all__ = [
     "AcceleratorUtil",
     "AcceleratorType",
     "HardwareInfo",
-    "DOSW1HWInfo",
-    "DualFrankaHWInfo",
-    "FrankaHWInfo",
-    "GimArmHWInfo",
-    "Turtle2HWInfo",
     "CollectiveGroupOptions",
     "Cluster",
     "ClusterConfig",
@@ -83,6 +82,12 @@ __all__ = [
     "merge_batches",
     "WorkerInfo",
     "Channel",
+    "ChannelContext",
+    "Collector",
+    "Dispatcher",
+    "register_collector",
+    "register_dispatcher",
     "ChannelWorker",
     "WeightedItem",
+    "Tracer",
 ]
