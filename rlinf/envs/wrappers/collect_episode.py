@@ -28,6 +28,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+from rlinf.data.schema.embodied_types import LeRobotFrame
 from rlinf.utils.logging import get_logger
 
 _VALID_FORMATS = ("pickle", "lerobot")
@@ -292,15 +293,35 @@ class CollectEpisode(gym.Wrapper):
     def close(self):
         if self._closed:
             return None
-        self._closed = True
-        self._finalize_lerobot()
-        self._wait_futures()
+        error = None
+        try:
+            self._finalize_lerobot()
+        except BaseException as exc:  # noqa: BLE001 - release resources on failure
+            error = exc
+        try:
+            self._wait_futures()
+        except BaseException as exc:  # noqa: BLE001 - release resources on failure
+            if error is None:
+                error = exc
         if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
-        if hasattr(self.env, "close"):
-            return self.env.close()
-        return None
+            try:
+                self._executor.shutdown(wait=True)
+            except BaseException as exc:  # noqa: BLE001 - preserve first failure
+                if error is None:
+                    error = exc
+            finally:
+                self._executor = None
+        result = None
+        try:
+            if hasattr(self.env, "close"):
+                result = self.env.close()
+        except BaseException as exc:  # noqa: BLE001 - preserve first failure
+            if error is None:
+                error = exc
+        self._closed = error is None
+        if error is not None:
+            raise error
+        return result
 
     def _new_buffer(self) -> dict[str, list]:
         return {
@@ -511,9 +532,6 @@ class CollectEpisode(gym.Wrapper):
         first_term_step: Optional[int] = None
         for i, action in enumerate(actions):
             obs = obs_steps[i] if i < len(obs_steps) else None
-            image, wrist_image, extra_view_image, state = self._extract_obs_image_state(
-                obs
-            )
             # Overwrite action with intervene action if present.
             np_action = self._to_numpy(action)
             raw_info = buf["infos"][i + 1]
@@ -535,30 +553,18 @@ class CollectEpisode(gym.Wrapper):
             ):
                 if info_with_intervene["intervene_flag"].all():
                     np_action = self._to_numpy(info_with_intervene["intervene_action"])
-            if state is None or np_action is None:
-                continue
             intervene_flag = self._intervene_flag_from_info(info_with_intervene)
             seg_id = int(seg_ids[i]) if i < len(seg_ids) else 0
-            frame: dict[str, Any] = {
-                "state": np.asarray(state).astype(np.float32),
-                "actions": np.asarray(np_action).astype(np.float32).flatten(),
-                "task": task_desc,
-                "is_success": np.array([is_success], dtype=bool),
-                "done": np.array([False], dtype=bool),
-                "intervene_flag": np.array([intervene_flag], dtype=bool),
-                "segment_id": np.array([seg_id], dtype=np.uint8),
-            }
-            if image is not None:
-                frame["image"] = self._to_uint8(np.asarray(image))
-            for key, img in self._expand_multi_view_images(
-                "wrist_image", wrist_image
-            ).items():
-                frame[key] = self._to_uint8(np.asarray(img))
-            for key, img in self._expand_multi_view_images(
-                "extra_view_image", extra_view_image
-            ).items():
-                frame[key] = self._to_uint8(np.asarray(img))
-            steps.append(frame)
+            frame = LeRobotFrame.from_values(
+                observation=obs,
+                action=np_action,
+                task=task_desc,
+                intervene_flag=intervene_flag,
+                segment_id=seg_id,
+            )
+            if frame is None:
+                continue
+            steps.append(frame.to_dict(episode_success=is_success, done=False))
             if bool(terminated[i]) and first_term_step is None:
                 first_term_step = len(steps)
         if not steps:
@@ -570,7 +576,7 @@ class CollectEpisode(gym.Wrapper):
 
     def _ensure_lerobot_writer(self, ep_data: dict):
         """Get-or-create the LeRobot writer. Must be called under ``_lerobot_lock``."""
-        from rlinf.data.lerobot_writer import LeRobotDatasetWriter
+        from rlinf.data.storage.lerobot import LeRobotDatasetWriter
 
         if self._lerobot_writer is None:
             self._lerobot_writer = LeRobotDatasetWriter()
@@ -580,10 +586,16 @@ class CollectEpisode(gym.Wrapper):
             first = ep_data[0]
             wrist_image_keys = self._collect_image_keys(first, "wrist_image")
             extra_view_image_keys = self._collect_image_keys(first, "extra_view_image")
+            # A previous interrupted export may have created the shard
+            # directory before failing.  LeRobot refuses to reuse that path
+            # (its metadata creator uses ``exist_ok=False``), so advance to
+            # the next free shard instead of failing during ``q`` cleanup or
+            # on the next collection run.
+            rank_dir = os.path.join(self.save_dir, f"rank_{self.rank}")
+            while os.path.exists(os.path.join(rank_dir, f"id_{shard_id}")):
+                shard_id += 1
             self._lerobot_writer.create(
-                repo_id=os.path.join(
-                    self.save_dir, f"rank_{self.rank}", f"id_{shard_id}"
-                ),
+                repo_id=os.path.join(rank_dir, f"id_{shard_id}"),
                 robot_type=self.robot_type,
                 fps=self.fps,
                 image_shape=first["image"].shape if "image" in first else None,
@@ -606,7 +618,9 @@ class CollectEpisode(gym.Wrapper):
         """Return ``{key: (H, W, C)}`` for all frame keys matching *prefix*.
 
         Matches both the bare ``prefix`` (e.g. ``wrist_image``) and indexed
-        variants (``wrist_image/0``, ``wrist_image/1``, …).
+        variants (``wrist_image-0``, ``wrist_image-1``, …). The separator is a
+        hyphen, not ``/``: lerobot >= 0.3 rejects feature names containing
+        ``/`` in ``LeRobotDatasetMetadata.create``.
         """
         return {
             k: tuple(frame[k].shape)
@@ -624,6 +638,7 @@ class CollectEpisode(gym.Wrapper):
             count = self._episodes_written
             if self.finalize_interval > 0 and count % self.finalize_interval == 0:
                 writer.finalize()
+                self._lerobot_writer = None
 
     def _finalize_lerobot(self) -> None:
         """Drain pending futures then write the LeRobot dataset metadata."""
@@ -656,9 +671,16 @@ class CollectEpisode(gym.Wrapper):
         self._futures = remaining
 
     def _wait_futures(self) -> None:
-        for f in self._futures:
-            f.result()
-        self._futures = []
+        futures, self._futures = self._futures, []
+        first_error = None
+        for future in futures:
+            try:
+                future.result()
+            except BaseException as exc:  # noqa: BLE001 - drain every completed write
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def _finalize_on_exit(self) -> None:
         self.close()
@@ -769,48 +791,6 @@ class CollectEpisode(gym.Wrapper):
             return str(desc)
         return "unknown task"
 
-    def _extract_obs_image_state(self, obs):
-        """Return ``(image, wrist_image, extra_view_image, state)`` from an obs dict.
-
-        ``wrist_image`` and ``extra_view_image`` are returned as raw numpy
-        arrays and may have shape ``[H, W, C]`` *or* ``[N, H, W, C]``.
-        Use :meth:`_expand_multi_view_images` to fan them out into
-        individually-keyed views before writing.
-        """
-        if not isinstance(obs, dict):
-            return None, None, None, None
-        image = obs.get("main_images", obs.get("image", obs.get("full_image")))
-        wrist_image = obs.get("wrist_images", obs.get("wrist_image"))
-        extra_view_image = obs.get("extra_view_images", obs.get("extra_view_image"))
-        state = obs.get("states", obs.get("state"))
-        return (
-            self._to_numpy(image),
-            self._to_numpy(wrist_image),
-            self._to_numpy(extra_view_image),
-            self._to_numpy(state),
-        )
-
-    @staticmethod
-    def _expand_multi_view_images(
-        base_key: str,
-        arr: Optional[np.ndarray],
-    ) -> dict[str, np.ndarray]:
-        """Expand a potentially batched image array into per-view entries.
-
-        * ``[H, W, C]``           → ``{base_key: img}``
-        * ``[1, H, W, C]``        → ``{base_key: img[0]}``
-        * ``[N, H, W, C]`` (N>1)  → ``{base_key-0: img[0], …, base_key-N-1: img[N-1]}``
-        """
-        if arr is None:
-            return {}
-        if arr.ndim == 3:
-            return {base_key: arr}
-        if arr.ndim == 4:
-            if arr.shape[0] == 1:
-                return {base_key: arr[0]}
-            return {f"{base_key}-{i}": arr[i] for i in range(arr.shape[0])}
-        return {base_key: arr}
-
     def _slice_data(self, data, env_idx: int):
         """Slice batched data for a single env without copying."""
         if isinstance(data, torch.Tensor):
@@ -858,14 +838,6 @@ class CollectEpisode(gym.Wrapper):
         if isinstance(data, torch.Tensor):
             return data.detach().cpu().numpy()
         return np.asarray(data)
-
-    @staticmethod
-    def _to_uint8(arr: np.ndarray) -> np.ndarray:
-        if arr.dtype == np.uint8:
-            return arr
-        return (
-            (arr * 255).astype(np.uint8) if arr.max() <= 1.0 else arr.astype(np.uint8)
-        )
 
     def _copy(self, data):
         if isinstance(data, torch.Tensor):
